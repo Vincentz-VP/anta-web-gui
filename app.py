@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from contextlib import contextmanager
 from importlib.metadata import version as pkg_version, PackageNotFoundError
 from anta.catalog import AntaCatalog
+from device_catalog_dir import render_device_catalog_tab
 
 NRFU_SUBPROCESS_TIMEOUT = 600
 CLI_SUBPROCESS_TIMEOUT = 60
@@ -423,8 +424,9 @@ st.title("🚀 Arista ANTA Web GUI")
 st.markdown(f"Manage devices, configure tests, and execute network validations. *(Built on Arista ANTA v{ANTA_VERSION})*")
 st.divider()
 
-tab_dashboard, tab_creds, tab_inventory, tab_catalog, tab_cli = st.tabs([
-    "🚀 Dashboard", "🔑 Credentials", "🌐 Manage Inventory", "📋 Manage Tests", "🛠️ Raw CLI"
+tab_dashboard, tab_creds, tab_inventory, tab_catalog, tab_cli, tab_device_catalogs = st.tabs([
+    "🚀 Dashboard", "🔑 Credentials", "🌐 Manage Inventory", "📋 Manage Tests", "🛠️ Raw CLI",
+    "📂 Device Catalogs",
 ])
 
 # ==========================================
@@ -2115,6 +2117,17 @@ with tab_dashboard:
             if os.path.exists(run_stderr_file):
                 try: os.remove(run_stderr_file)
                 except Exception: pass
+
+# ==========================================
+# TAB: DEVICE CATALOG DIRECTORY (pre-generated NRFU catalogs)
+# ==========================================
+with tab_device_catalogs:
+    render_device_catalog_tab(
+        st,
+        load_inventory=load_inventory,
+        log_event=log_event,
+        nrfu_timeout=NRFU_SUBPROCESS_TIMEOUT,
+    )
 
 # ==========================================
 # TAB 5: RAW CLI (Custom Commands)

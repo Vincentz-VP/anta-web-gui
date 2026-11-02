@@ -16,6 +16,11 @@ This project enables network engineers to design, build, and execute Network Rea
 * Real-time generation and auto-saving of valid `catalog.yml` files.
 * Native support for dynamic `VerifyRunningConfig` rules with custom match conditions.
 
+* **📂 Device catalog directory:**
+* Run pre-generated per-device ANTA catalogs from a folder (`<hostname>.json` or `.yaml`).
+* Matches the layout produced by [Arista AVD `anta_runner`](https://avd.arista.com/latest/docs/installation/anta/index.html) (`avd/anta/avd_catalogs/`).
+* Configure with the **Device Catalogs** tab or set `ANTA_DEVICE_CATALOGS_DIR` (also accepts `AVD_CATALOGS_DIR`).
+
 
 * **🎯 Test Profile Presets:**
 * Switch between testing profiles on the fly (e.g., *Basic NRFU Quick Check*, *Deep NRFU Full Audit*).
@@ -84,11 +89,25 @@ Open your browser and navigate to `http://localhost:8501`.
 ## 📂 Project Structure
 
 ```text
-├── app.py           # Main Streamlit Dashboard Application
-├── Dockerfile       # Container build specifications
-├── restart.sh       # Automation script for container rebuilds
-├── entrypoint.sh    # Docker initialization script
-├── inventory.yml    # Auto-generated ANTA Inventory
-└── .gitignore       # Git exclusion rules
+├── app.py                 # Main Streamlit Dashboard Application
+├── device_catalog_dir.py  # Per-device catalog directory NRFU runner
+├── Dockerfile             # Container build specifications
+├── restart.sh             # Automation script for container rebuilds
+├── entrypoint.sh          # Docker initialization script
+├── inventory.yml          # Auto-generated ANTA Inventory
+└── .gitignore             # Git exclusion rules
 
 ```
+
+### Device catalog directory (Docker)
+
+Mount a read-only directory of per-device catalog files and point the app at it:
+
+```bash
+docker run -p 8501:8501 \
+  -e ANTA_DEVICE_CATALOGS_DIR=/catalogs \
+  -v /path/to/avd/anta/avd_catalogs:/catalogs:ro \
+  anta-web-gui
+```
+
+Inventory host **names** must match catalog filenames (e.g. `leaf1.json` → host name `leaf1`).
