@@ -21,10 +21,53 @@ DEFAULT_CATALOGS_DIR = os.environ.get(
     os.environ.get("AVD_CATALOGS_DIR", ""),
 )
 
+RUN_MODE_DEVICE_CATALOG = "device_catalog_dir"
+AVD_PROFILE_NAME = os.environ.get(
+    "ANTA_CATALOG_PROFILE_NAME",
+    "📐 AVD design catalogs",
+)
+
 
 def resolve_catalogs_dir(override: str | None = None) -> str:
     path = (override or "").strip() or DEFAULT_CATALOGS_DIR.strip()
     return path
+
+
+def catalog_profile_description(catalogs_dir: str) -> str:
+    custom = os.environ.get("ANTA_CATALOG_PROFILE_DESCRIPTION", "").strip()
+    if custom:
+        return custom
+    source = os.environ.get("ANTA_CATALOG_SOURCE_LABEL", "AVD `anta_runner`").strip()
+    return (
+        f"Tests are loaded from **pre-generated per-device catalog files** in `{catalogs_dir}` "
+        f"(one `<inventory_name>.json` per switch). Catalogs are produced by {source} from the "
+        "fabric structured configuration—not from the Manage Tests checkboxes."
+    )
+
+
+def device_catalog_profile_entry() -> dict[str, Any] | None:
+    """Built-in sidebar profile when a catalog directory is configured (e.g. avd-demo lab)."""
+    catalogs_dir = resolve_catalogs_dir()
+    if not catalogs_dir:
+        return None
+    return {
+        "run_mode": RUN_MODE_DEVICE_CATALOG,
+        "catalogs_dir": catalogs_dir,
+        "description": catalog_profile_description(catalogs_dir),
+        "keys": [],
+        "cfg_rules": [],
+        "builtin": True,
+    }
+
+
+def merge_device_catalog_profile(profiles: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(profiles)
+    entry = device_catalog_profile_entry()
+    if entry:
+        merged[AVD_PROFILE_NAME] = entry
+    elif AVD_PROFILE_NAME in merged and merged[AVD_PROFILE_NAME].get("builtin"):
+        del merged[AVD_PROFILE_NAME]
+    return merged
 
 
 def list_device_catalogs(catalogs_dir: str) -> list[str]:
@@ -257,77 +300,12 @@ def display_nrfu_results(st, results: list[dict[str, Any]], full_log: str = "") 
             st.code(full_log, language=None)
 
 
-def render_device_catalog_tab(st, *, load_inventory, log_event, nrfu_timeout: int) -> None:
-    st.subheader("📂 Device catalog directory")
-    st.caption(
-        "Run pre-generated ANTA catalogs: one file per device named after the inventory "
-        "**name** (e.g. `leaf1.json`). "
-        "[Arista AVD](https://avd.arista.com/latest/docs/installation/anta/index.html) "
-        "`anta_runner` writes this layout under `avd/anta/avd_catalogs/`."
-    )
-
-    default_dir = resolve_catalogs_dir()
-    if "device_catalogs_dir_input" not in st.session_state:
-        st.session_state.device_catalogs_dir_input = default_dir
-
-    catalogs_dir = st.text_input(
-        "Catalog directory path",
-        key="device_catalogs_dir_input",
-        help="Set `ANTA_DEVICE_CATALOGS_DIR` in the environment to pre-fill this field.",
-    ).strip()
-
-    catalog_devices = list_device_catalogs(catalogs_dir)
-
-    if not catalogs_dir:
-        st.info("Enter a directory path or set the `ANTA_DEVICE_CATALOGS_DIR` environment variable.")
-        return
-    if not catalog_devices:
-        st.warning(
-            f"No `*.json` / `*.yaml` catalogs found in `{catalogs_dir}`. "
-            "Each file should be named `<inventory_host_name>.json`."
-        )
-        return
-
-    st.info(
-        f"**{len(catalog_devices)}** catalog file(s): "
-        + ", ".join(f"`{n}`" for n in catalog_devices)
-    )
-
-    try:
-        inv_data = load_inventory()
-    except Exception:
-        inv_data = {}
+def inventory_catalog_warnings(
+    catalog_devices: list[str], inventory_payload: dict[str, Any]
+) -> list[str]:
     host_names = [
-        h.get("name") for h in inv_data.get("anta_inventory", {}).get("hosts", []) if h.get("name")
+        h.get("name")
+        for h in inventory_payload.get("anta_inventory", {}).get("hosts", [])
+        if h.get("name")
     ]
-    missing = [d for d in catalog_devices if d not in host_names]
-    if missing:
-        st.warning(
-            "Catalogs without a matching inventory **name**: "
-            + ", ".join(f"`{m}`" for m in missing)
-        )
-
-    if st.button("🚀 Run device catalog suite", type="primary", use_container_width=True):
-        run_env = os.environ.copy()
-        run_env["ANTA_USERNAME"] = st.session_state.get(
-            "anta_user", run_env.get("ANTA_USERNAME", "admin")
-        )
-        run_env["ANTA_PASSWORD"] = st.session_state.get(
-            "anta_pass", run_env.get("ANTA_PASSWORD", "admin")
-        )
-
-        log_event(
-            "device_catalog_suite_run",
-            {"device_count": len(catalog_devices), "catalogs_dir": catalogs_dir},
-        )
-
-        status = st.empty()
-        results, full_log = run_device_catalog_suite(
-            catalogs_dir=catalogs_dir,
-            inventory_payload=inv_data,
-            run_env=run_env,
-            nrfu_timeout=nrfu_timeout,
-            status_callback=lambda msg: status.info(f"⏳ {msg}"),
-        )
-        status.empty()
-        display_nrfu_results(st, results, full_log)
+    return [d for d in catalog_devices if d not in host_names]

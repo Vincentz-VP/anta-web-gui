@@ -13,7 +13,16 @@ from datetime import datetime, timezone
 from contextlib import contextmanager
 from importlib.metadata import version as pkg_version, PackageNotFoundError
 from anta.catalog import AntaCatalog
-from device_catalog_dir import render_device_catalog_tab
+from device_catalog_dir import (
+    AVD_PROFILE_NAME,
+    RUN_MODE_DEVICE_CATALOG,
+    display_nrfu_results,
+    list_device_catalogs,
+    merge_device_catalog_profile,
+    inventory_catalog_warnings,
+    resolve_catalogs_dir,
+    run_device_catalog_suite,
+)
 
 NRFU_SUBPROCESS_TIMEOUT = 600
 CLI_SUBPROCESS_TIMEOUT = 60
@@ -331,7 +340,8 @@ DEFAULT_PROFILES = {
     }
 }
 
-active_profiles = saved_settings.get("profiles", DEFAULT_PROFILES)
+_saved_profiles = saved_settings.get("profiles", DEFAULT_PROFILES)
+active_profiles = merge_device_catalog_profile(_saved_profiles)
 
 # Initialize master state dictionary per user session
 if "master_test_states" not in st.session_state:
@@ -366,10 +376,27 @@ with st.sidebar:
     st.markdown("##### 🎯 Active Profile Presets")
     
     selected_prof_name = st.selectbox("Select Active Profile", options=list(active_profiles.keys()), key="sb_selected_prof")
+    _selected_prof = active_profiles.get(selected_prof_name, {})
+    _is_device_catalog_prof = _selected_prof.get("run_mode") == RUN_MODE_DEVICE_CATALOG
+
+    if _is_device_catalog_prof:
+        st.markdown(_selected_prof.get("description", ""))
+        _cat_dir = _selected_prof.get("catalogs_dir") or resolve_catalogs_dir()
+        _cat_devices = list_device_catalogs(_cat_dir)
+        if _cat_dir and _cat_devices:
+            st.caption(
+                f"**{len(_cat_devices)}** catalog file(s) in `{_cat_dir}`: "
+                + ", ".join(f"`{n}`" for n in _cat_devices)
+            )
+        elif _cat_dir:
+            st.warning(f"No `*.json` / `*.yaml` catalogs in `{_cat_dir}` yet.")
+        st.caption("Run tests from the **Dashboard** tab (same as other profiles).")
+    else:
+        st.caption("Use **Load** to apply checkbox tests to Manage Tests / Dashboard.")
 
     col_prof1, col_prof2 = st.columns(2)
     with col_prof1:
-        if st.button("📂 Load", use_container_width=True, type="primary"):
+        if st.button("📂 Load", use_container_width=True, type="primary", disabled=_is_device_catalog_prof):
             p_data = active_profiles.get(selected_prof_name, {})
             p_keys = set(p_data.get("keys", []))
             for k in ALL_TEST_KEYS:
@@ -382,13 +409,19 @@ with st.sidebar:
             st.rerun()
 
     with col_prof2:
-        if st.button("💾 Save", use_container_width=True):
+        if st.button("💾 Save", use_container_width=True, disabled=_is_device_catalog_prof or _selected_prof.get("builtin")):
             current_keys = [k for k in ALL_TEST_KEYS if st.session_state["master_test_states"].get(k, False)]
-            active_profiles[selected_prof_name] = {
+            profiles_to_save = merge_device_catalog_profile(_saved_profiles)
+            profiles_to_save[selected_prof_name] = {
                 "keys": current_keys,
                 "cfg_rules": st.session_state.get("cfg_rules_data", default_config_rules)
             }
-            if save_settings({"profiles": active_profiles, "selected_test_keys": current_keys}):
+            # Persist user profiles only (omit built-in device-catalog profile).
+            persist = {
+                k: v for k, v in profiles_to_save.items()
+                if not v.get("builtin") and v.get("run_mode") != RUN_MODE_DEVICE_CATALOG
+            }
+            if save_settings({"profiles": persist, "selected_test_keys": current_keys}):
                 st.success("Saved!")
 
     st.markdown("---")
@@ -400,19 +433,24 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    selected_count = sum(1 for k in ALL_TEST_KEYS if st.session_state["master_test_states"].get(k, False))
-    st.metric("📋 Selected Tests", f"{selected_count} / {len(ALL_TEST_KEYS)}")
+    if _is_device_catalog_prof:
+        _cat_dir = _selected_prof.get("catalogs_dir") or resolve_catalogs_dir()
+        _cat_n = len(list_device_catalogs(_cat_dir))
+        st.metric("📂 Catalog devices", _cat_n)
+    else:
+        selected_count = sum(1 for k in ALL_TEST_KEYS if st.session_state["master_test_states"].get(k, False))
+        st.metric("📋 Selected Tests", f"{selected_count} / {len(ALL_TEST_KEYS)}")
 
-    def toggle_select_all():
-        current_all_selected = all(st.session_state["master_test_states"].get(k, False) for k in ALL_TEST_KEYS)
-        new_state = not current_all_selected
-        for k in ALL_TEST_KEYS:
-            st.session_state["master_test_states"][k] = new_state
-            st.session_state[k] = new_state
+        def toggle_select_all():
+            current_all_selected = all(st.session_state["master_test_states"].get(k, False) for k in ALL_TEST_KEYS)
+            new_state = not current_all_selected
+            for k in ALL_TEST_KEYS:
+                st.session_state["master_test_states"][k] = new_state
+                st.session_state[k] = new_state
 
-    is_all_selected = all(st.session_state["master_test_states"].get(k, False) for k in ALL_TEST_KEYS)
-    select_label = "❌ Deselect All Tests" if is_all_selected else "✅ Select All Tests"
-    st.button(select_label, on_click=toggle_select_all, use_container_width=True)
+        is_all_selected = all(st.session_state["master_test_states"].get(k, False) for k in ALL_TEST_KEYS)
+        select_label = "❌ Deselect All Tests" if is_all_selected else "✅ Select All Tests"
+        st.button(select_label, on_click=toggle_select_all, use_container_width=True)
 
     st.markdown("---")
     st.caption(f"Built on Arista ANTA v{ANTA_VERSION}")
@@ -424,9 +462,8 @@ st.title("🚀 Arista ANTA Web GUI")
 st.markdown(f"Manage devices, configure tests, and execute network validations. *(Built on Arista ANTA v{ANTA_VERSION})*")
 st.divider()
 
-tab_dashboard, tab_creds, tab_inventory, tab_catalog, tab_cli, tab_device_catalogs = st.tabs([
+tab_dashboard, tab_creds, tab_inventory, tab_catalog, tab_cli = st.tabs([
     "🚀 Dashboard", "🔑 Credentials", "🌐 Manage Inventory", "📋 Manage Tests", "🛠️ Raw CLI",
-    "📂 Device Catalogs",
 ])
 
 # ==========================================
@@ -569,6 +606,14 @@ with tab_inventory:
 # ==========================================
 with tab_catalog:
     st.subheader("📋 Test Catalog Builder")
+    _catalog_prof = active_profiles.get(st.session_state.get("sb_selected_prof", ""), {})
+    if _catalog_prof.get("run_mode") == RUN_MODE_DEVICE_CATALOG:
+        st.info(
+            f"Profile **{st.session_state.get('sb_selected_prof')}** uses external catalog files. "
+            "Tests are defined under "
+            f"`{_catalog_prof.get('catalogs_dir') or resolve_catalogs_dir()}`, not here. "
+            "Run them from the **Dashboard**."
+        )
     nav_side_col, main_content_col = st.columns([1.1, 3.5], gap="large")
 
     with nav_side_col:
@@ -1802,10 +1847,29 @@ with tab_catalog:
 # ==========================================
 with tab_dashboard:
     st.subheader("Run Network Tests")
-    
-    # Show active execution test count indicator
+
+    _dash_prof_name = st.session_state.get("sb_selected_prof", "")
+    _dash_prof = active_profiles.get(_dash_prof_name, {})
+    _dash_device_catalog = _dash_prof.get("run_mode") == RUN_MODE_DEVICE_CATALOG
+    _dash_cat_dir = (_dash_prof.get("catalogs_dir") or resolve_catalogs_dir()) if _dash_device_catalog else ""
+    _dash_cat_devices = list_device_catalogs(_dash_cat_dir) if _dash_device_catalog else []
+
     selected_run_count = sum(1 for k in ALL_TEST_KEYS if st.session_state["master_test_states"].get(k, False))
-    st.info(f"⚡ **Ready to execute {selected_run_count} selected test(s)** on configured inventory devices.")
+
+    if _dash_device_catalog:
+        st.markdown(_dash_prof.get("description", ""))
+        if _dash_cat_devices:
+            st.info(
+                f"⚡ **Ready to execute device catalogs for {len(_dash_cat_devices)} switch(es)** "
+                f"from `{_dash_cat_dir}` (profile: **{_dash_prof_name}**)."
+            )
+        else:
+            st.warning(
+                f"No catalog files in `{_dash_cat_dir}`. Generate them (e.g. `./lab avd build` and "
+                "`./lab avd test` in avd-demo) and refresh this page."
+            )
+    else:
+        st.info(f"⚡ **Ready to execute {selected_run_count} selected test(s)** on configured inventory devices.")
 
     # Reuse the sidebar's "Filter Tags" value instead of a separate input here.
     # ANTA's `--tags` filter at execution time requires devices AND catalog
@@ -1815,10 +1879,13 @@ with tab_dashboard:
     # run"), which is exactly what used to happen when only this field was
     # filled in.
     run_tags_input = st.session_state.get("input_catalog_tags", "")
-    if run_tags_input.strip():
-        st.caption(f"🏷️ Execution filtered to tag(s): **{run_tags_input.strip()}** (set via \"Filter Tags\" in the sidebar).")
-    else:
-        st.caption("🏷️ No tag filter active - tests will run against all inventory devices. Set one via \"Filter Tags\" in the sidebar to scope both the catalog and the execution to matching devices.")
+    if not _dash_device_catalog:
+        if run_tags_input.strip():
+            st.caption(f"🏷️ Execution filtered to tag(s): **{run_tags_input.strip()}** (set via \"Filter Tags\" in the sidebar).")
+        else:
+            st.caption("🏷️ No tag filter active - tests will run against all inventory devices. Set one via \"Filter Tags\" in the sidebar to scope both the catalog and the execution to matching devices.")
+    elif run_tags_input.strip():
+        st.caption("🏷️ Tag filters do not apply to the AVD device-catalog profile (each file is scoped with `-d <hostname>`).")
 
     try:
         _dashboard_anta_inv = load_inventory().get("anta_inventory", {})
@@ -1849,15 +1916,49 @@ with tab_dashboard:
         + len(_dashboard_anta_inv.get("networks", []))
         + len(_dashboard_anta_inv.get("ranges", []))
     )
+    _execute_disabled = _dash_device_catalog and not _dash_cat_devices
     if _total_devices == 0:
         st.error("⚠️ Inventory is empty - add at least one device, network, or IP range in \"Manage Inventory\" before running tests.")
-    elif st.button("🚀 Execute Tests", type="primary", use_container_width=True):
+    elif st.button("🚀 Execute Tests", type="primary", use_container_width=True, disabled=_execute_disabled):
         # Build an isolated env for this run's subprocess instead of mutating the
         # shared process-wide os.environ, which would race with other concurrent
         # user sessions running in the same Streamlit process.
         run_env = os.environ.copy()
         run_env["ANTA_USERNAME"] = st.session_state.anta_user
         run_env["ANTA_PASSWORD"] = st.session_state.anta_pass
+
+        if _dash_device_catalog:
+            try:
+                _dc_inv = load_inventory()
+            except Exception:
+                _dc_inv = {}
+            _missing = inventory_catalog_warnings(_dash_cat_devices, _dc_inv)
+            if _missing:
+                st.warning(
+                    "Catalogs without inventory name: " + ", ".join(f"`{m}`" for m in _missing)
+                )
+            log_event(
+                "device_catalog_suite_run",
+                {
+                    "profile": _dash_prof_name,
+                    "device_count": len(_dash_cat_devices),
+                    "catalogs_dir": _dash_cat_dir,
+                },
+            )
+            status_placeholder = st.empty()
+            full_log = ""
+            try:
+                results, full_log = run_device_catalog_suite(
+                    catalogs_dir=_dash_cat_dir,
+                    inventory_payload=_dc_inv,
+                    run_env=run_env,
+                    nrfu_timeout=NRFU_SUBPROCESS_TIMEOUT,
+                    status_callback=lambda msg: status_placeholder.info(f"⏳ {msg}"),
+                )
+            finally:
+                status_placeholder.empty()
+            display_nrfu_results(st, results, full_log)
+            st.stop()
 
         # Unique UUID per execution run to ensure isolated parallel execution
         run_id = str(uuid.uuid4())[:8]
@@ -2117,17 +2218,6 @@ with tab_dashboard:
             if os.path.exists(run_stderr_file):
                 try: os.remove(run_stderr_file)
                 except Exception: pass
-
-# ==========================================
-# TAB: DEVICE CATALOG DIRECTORY (pre-generated NRFU catalogs)
-# ==========================================
-with tab_device_catalogs:
-    render_device_catalog_tab(
-        st,
-        load_inventory=load_inventory,
-        log_event=log_event,
-        nrfu_timeout=NRFU_SUBPROCESS_TIMEOUT,
-    )
 
 # ==========================================
 # TAB 5: RAW CLI (Custom Commands)

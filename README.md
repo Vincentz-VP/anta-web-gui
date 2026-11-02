@@ -16,10 +16,10 @@ This project enables network engineers to design, build, and execute Network Rea
 * Real-time generation and auto-saving of valid `catalog.yml` files.
 * Native support for dynamic `VerifyRunningConfig` rules with custom match conditions.
 
-* **📂 Device catalog directory:**
-* Run pre-generated per-device ANTA catalogs from a folder (`<hostname>.json` or `.yaml`).
-* Matches the layout produced by [Arista AVD `anta_runner`](https://avd.arista.com/latest/docs/installation/anta/index.html) (`avd/anta/avd_catalogs/`).
-* Configure with the **Device Catalogs** tab or set `ANTA_DEVICE_CATALOGS_DIR` (also accepts `AVD_CATALOGS_DIR`).
+* **📂 Device catalog directory (profile):**
+* When `ANTA_DEVICE_CATALOGS_DIR` is set, a built-in sidebar profile runs pre-generated per-device catalogs (`<hostname>.json` or `.yaml`).
+* Matches [Arista AVD `anta_runner`](https://avd.arista.com/latest/docs/installation/anta/index.html) output (`avd/anta/avd_catalogs/`). Description via `ANTA_CATALOG_PROFILE_DESCRIPTION`.
+* Execute from the **Dashboard** like other profiles (no separate tab).
 
 
 * **🎯 Test Profile Presets:**
