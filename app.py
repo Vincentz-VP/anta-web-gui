@@ -409,7 +409,11 @@ with st.sidebar:
             st.rerun()
 
     with col_prof2:
-        if st.button("💾 Save", use_container_width=True, disabled=_is_device_catalog_prof or _selected_prof.get("builtin")):
+        if st.button(
+            "💾 Save",
+            use_container_width=True,
+            disabled=_is_device_catalog_prof or bool(_selected_prof.get("builtin")),
+        ):
             current_keys = [k for k in ALL_TEST_KEYS if st.session_state["master_test_states"].get(k, False)]
             profiles_to_save = merge_device_catalog_profile(_saved_profiles)
             profiles_to_save[selected_prof_name] = {
