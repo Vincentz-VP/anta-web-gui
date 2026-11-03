@@ -120,3 +120,22 @@ Optional tuning (environment variables):
 | `ANTA_DEVICE_CATALOG_TIMEOUT` | `300` | Seconds per device before it is marked as an error (capped by the global NRFU timeout) |
 | `ANTA_DEVICE_CATALOG_ENABLE` | off | Set to `1` to pass `--enable` to `anta nrfu` for these runs |
 
+AVD catalogs that inspect running configuration or run privileged commands need
+`-e ANTA_DEVICE_CATALOG_ENABLE=1`. This remains opt-in for other deployments.
+
+### Credential defaults
+
+Set `ANTA_USERNAME` and `ANTA_PASSWORD` to seed credentials for a new browser.
+Credentials saved in the GUI take precedence; without these variables the
+defaults remain `admin` / `admin`.
+
+### Regression checks
+
+With the application dependencies installed, run:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+These checks use temporary browser settings and do not contact any devices.
+

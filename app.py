@@ -507,8 +507,8 @@ tab_dashboard, tab_creds, tab_inventory, tab_catalog, tab_cli, tab_help = st.tab
 with tab_creds:
     st.subheader("Device Credentials")
     st.caption("These fields only affect your own browser session unless you click Save below.")
-    if "anta_user" not in st.session_state: st.session_state.anta_user = saved_settings.get("anta_user", "admin")
-    if "anta_pass" not in st.session_state: st.session_state.anta_pass = saved_settings.get("anta_pass", "admin")
+    if "anta_user" not in st.session_state: st.session_state.anta_user = saved_settings.get("anta_user", os.environ.get("ANTA_USERNAME", "admin"))
+    if "anta_pass" not in st.session_state: st.session_state.anta_pass = saved_settings.get("anta_pass", os.environ.get("ANTA_PASSWORD", "admin"))
 
     st.session_state.anta_user = st.text_input("Username", value=st.session_state.anta_user, key="input_anta_user")
     st.session_state.anta_pass = st.text_input("Password", value=st.session_state.anta_pass, type="password", key="input_anta_pass")
@@ -1906,7 +1906,7 @@ with tab_catalog:
                 valid_catalog_dict[module_name].append(test_entry)
                 
             except Exception as err:
-                test_cls_name = list(test_entry.keys())[0] if isinstance(test_entry, dict) else str(test_entry)
+                test_cls_name = next(iter(test_entry), str(test_entry)) if isinstance(test_entry, dict) else str(test_entry)
                 full_error_text = str(err)
                 
                 invalid_config_results.append({
