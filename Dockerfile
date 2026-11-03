@@ -6,7 +6,7 @@ RUN useradd --create-home --shell /bin/bash appuser
 
 WORKDIR /app
 
-COPY inventory.yml entrypoint.sh app.py ./
+COPY inventory.yml entrypoint.sh app.py device_catalog_dir.py help_content.py results_export.py ./
 RUN mkdir -p /app/data && chmod +x entrypoint.sh && chown -R appuser:appuser /app
 
 USER appuser

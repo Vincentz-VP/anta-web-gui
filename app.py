@@ -13,8 +13,9 @@ from datetime import datetime, timezone
 from contextlib import contextmanager
 from importlib.metadata import version as pkg_version, PackageNotFoundError
 from anta.catalog import AntaCatalog
+from help_content import render_help
+from results_export import results_export_buttons, parse_custom_yaml
 from device_catalog_dir import (
-    AVD_PROFILE_NAME,
     RUN_MODE_DEVICE_CATALOG,
     display_nrfu_results,
     list_device_catalogs,
@@ -375,6 +376,8 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("##### 🎯 Active Profile Presets")
     
+    if "_pending_profile" in st.session_state:  # set by "Save as" below; must precede the widget
+        st.session_state["sb_selected_prof"] = st.session_state.pop("_pending_profile")
     selected_prof_name = st.selectbox("Select Active Profile", options=list(active_profiles.keys()), key="sb_selected_prof")
     _selected_prof = active_profiles.get(selected_prof_name, {})
     _is_device_catalog_prof = _selected_prof.get("run_mode") == RUN_MODE_DEVICE_CATALOG
@@ -404,21 +407,45 @@ with st.sidebar:
                 st.session_state["master_test_states"][k] = is_sel
                 st.session_state[k] = is_sel
             st.session_state.cfg_rules_data = p_data.get("cfg_rules", default_config_rules)
+            st.session_state["custom_yaml_text"] = p_data.get("custom_yaml", "")
+            st.session_state.pop("param_custom_yaml", None)
             save_settings({"selected_test_keys": list(p_keys)})
             st.success(f"Loaded '{selected_prof_name}'!")
             st.rerun()
+
+    # "Save as": the name box defaults to the selected profile (overwrite) but can be
+    # changed to store the current selection as a new profile instead.
+    _save_name = st.text_input(
+        "Save as", value=selected_prof_name, key=f"sb_save_name_{selected_prof_name}",
+        disabled=_is_device_catalog_prof,
+        help="Keep the name to update this profile, or type a new name to create another profile.",
+    ).strip()
+    _name_taken = _save_name in active_profiles
+    _name_reserved = bool(active_profiles.get(_save_name, {}).get("builtin"))
+    _confirm_overwrite = True
+    if _is_device_catalog_prof:
+        pass
+    elif not _save_name:
+        st.caption("Enter a profile name.")
+    elif _name_reserved:
+        st.caption("⛔ That name is reserved - choose another.")
+    elif _name_taken:
+        _confirm_overwrite = st.checkbox(f"Overwrite existing '{_save_name}'", key=f"sb_confirm_{_save_name}")
+    else:
+        st.caption(f"➕ Will create a new profile '{_save_name}'.")
 
     with col_prof2:
         if st.button(
             "💾 Save",
             use_container_width=True,
-            disabled=_is_device_catalog_prof or bool(_selected_prof.get("builtin")),
+            disabled=_is_device_catalog_prof or not _save_name or _name_reserved or not _confirm_overwrite,
         ):
             current_keys = [k for k in ALL_TEST_KEYS if st.session_state["master_test_states"].get(k, False)]
             profiles_to_save = merge_device_catalog_profile(_saved_profiles)
-            profiles_to_save[selected_prof_name] = {
+            profiles_to_save[_save_name] = {
                 "keys": current_keys,
-                "cfg_rules": st.session_state.get("cfg_rules_data", default_config_rules)
+                "cfg_rules": st.session_state.get("cfg_rules_data", default_config_rules),
+                "custom_yaml": st.session_state.get("custom_yaml_text", ""),
             }
             # Persist user profiles only (omit built-in device-catalog profile).
             persist = {
@@ -426,7 +453,11 @@ with st.sidebar:
                 if not v.get("builtin") and v.get("run_mode") != RUN_MODE_DEVICE_CATALOG
             }
             if save_settings({"profiles": persist, "selected_test_keys": current_keys}):
-                st.success("Saved!")
+                if _name_taken:
+                    st.success("Saved!")
+                else:
+                    st.session_state["_pending_profile"] = _save_name
+                    st.rerun()
 
     st.markdown("---")
     st.markdown("##### 🏷️ Filter Tags")
@@ -466,8 +497,8 @@ st.title("🚀 Arista ANTA Web GUI")
 st.markdown(f"Manage devices, configure tests, and execute network validations. *(Built on Arista ANTA v{ANTA_VERSION})*")
 st.divider()
 
-tab_dashboard, tab_creds, tab_inventory, tab_catalog, tab_cli = st.tabs([
-    "🚀 Dashboard", "🔑 Credentials", "🌐 Manage Inventory", "📋 Manage Tests", "🛠️ Raw CLI",
+tab_dashboard, tab_creds, tab_inventory, tab_catalog, tab_cli, tab_help = st.tabs([
+    "🚀 Dashboard", "🔑 Credentials", "🌐 Manage Inventory", "📋 Manage Tests", "🛠️ Raw CLI", "❓ Help",
 ])
 
 # ==========================================
@@ -612,12 +643,33 @@ with tab_catalog:
     st.subheader("📋 Test Catalog Builder")
     _catalog_prof = active_profiles.get(st.session_state.get("sb_selected_prof", ""), {})
     if _catalog_prof.get("run_mode") == RUN_MODE_DEVICE_CATALOG:
-        st.info(
-            f"Profile **{st.session_state.get('sb_selected_prof')}** uses external catalog files. "
-            "Tests are defined under "
-            f"`{_catalog_prof.get('catalogs_dir') or resolve_catalogs_dir()}`, not here. "
-            "Run them from the **Dashboard**."
+        # Streamlit has no way to disable a whole tab, so grey out and block the
+        # builder with CSS. The widgets stay rendered (their state is preserved
+        # when the user switches back to a normal profile); only the banner above
+        # them stays fully readable. The banner sits in a keyed container so the
+        # CSS can find this tab's panel (an empty container is not rendered at
+        # all, so it cannot serve as the marker).
+        st.markdown(
+            """
+            <style>
+            div[role="tabpanel"]:has(.st-key-mt_lock_banner)
+              [data-testid="stHorizontalBlock"]:not([data-testid="stHorizontalBlock"] [data-testid="stHorizontalBlock"]) {
+                opacity: 0.35;
+                filter: grayscale(1);
+                pointer-events: none;
+                user-select: none;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
         )
+        with st.container(key="mt_lock_banner"):
+            st.info(
+                f"🔒 **Manage Tests is disabled** while profile **{st.session_state.get('sb_selected_prof')}** "
+                "is selected. This profile uses external catalog files; the tests are defined under "
+                f"`{_catalog_prof.get('catalogs_dir') or resolve_catalogs_dir()}`, not here. "
+                "Run them from the **Dashboard**, or pick another profile in the sidebar to edit tests."
+            )
     nav_side_col, main_content_col = st.columns([1.1, 3.5], gap="large")
 
     with nav_side_col:
@@ -1435,7 +1487,14 @@ with tab_catalog:
             bind_cb("Verify Security Advisory 0178 - CVE-2026-73440 (`SA178`)", "chk_adv_sa178")
 
         elif selected_cat == "Custom":
-            st.text_area("Custom YAML Input", value=st.session_state.get("param_custom_yaml", "# anta.tests...\n"), height=250, key="param_custom_yaml")
+            st.caption("Paste tests in ANTA catalog format. They are added to the checkbox selection on every run (and to saved profiles).")
+            st.text_area(
+                "Custom YAML Input",
+                value=st.session_state.get("custom_yaml_text", "# anta.tests.system:\n#   - VerifyUptime:\n#       minimum: 86400\n"),
+                height=250, key="param_custom_yaml",
+            )
+            # Widget state is dropped when another category is shown, so keep a copy.
+            st.session_state["custom_yaml_text"] = st.session_state["param_custom_yaml"]
 
     # Build Catalog Dictionary for Current Session
     catalog_dict = {}
@@ -1809,9 +1868,31 @@ with tab_catalog:
         if st.session_state["master_test_states"].get(k, False):
             add_test(mod, test_cls, params)
 
+    # --- CUSTOM YAML (merged into the catalog like any other selected test) ---
+    invalid_config_results = []
+    _custom_cat, _custom_err = parse_custom_yaml(st.session_state.get("custom_yaml_text", ""))
+    if _custom_err:
+        invalid_config_results.append({
+            "name": "Catalog Pre-Validator", "categories": ["custom_yaml"],
+            "description": "Custom YAML Input (could not be parsed)", "result": "error",
+            "messages": [_custom_err],
+        })
+    _custom_count = 0
+    for _mod, _tests in _custom_cat.items():
+        for _t in _tests:
+            if isinstance(_t, str):
+                _t = {_t: None}
+            if parsed_tags and isinstance(_t, dict) and len(_t) == 1:
+                _name = next(iter(_t))
+                _body = dict(_t[_name]) if isinstance(_t[_name], dict) else {}
+                _body.setdefault("filters", {"tags": parsed_tags})
+                _t = {_name: _body}
+            catalog_dict.setdefault(_mod, []).append(_t)
+            _custom_count += 1
+    st.session_state["custom_test_count"] = _custom_count
+
     # --- PER-TEST PRE-VALIDATION LOGIC (STORED IN SESSION_STATE) ---
     valid_catalog_dict = {}
-    invalid_config_results = []
 
     for module_name, tests_list in catalog_dict.items():
         for test_entry in tests_list:
@@ -1873,7 +1954,12 @@ with tab_dashboard:
                 "`./lab avd test` in avd-demo) and refresh this page."
             )
     else:
-        st.info(f"⚡ **Ready to execute {selected_run_count} selected test(s)** on configured inventory devices.")
+        _cc = st.session_state.get("custom_test_count", 0)
+        st.info(
+            f"⚡ **Ready to execute {selected_run_count} selected test(s)**"
+            + (f" **+ {_cc} from Custom YAML**" if _cc else "")
+            + " on configured inventory devices."
+        )
 
     # Reuse the sidebar's "Filter Tags" value instead of a separate input here.
     # ANTA's `--tags` filter at execution time requires devices AND catalog
@@ -1921,48 +2007,61 @@ with tab_dashboard:
         + len(_dashboard_anta_inv.get("ranges", []))
     )
     _execute_disabled = _dash_device_catalog and not _dash_cat_devices
+    _run_clicked = False
     if _total_devices == 0:
         st.error("⚠️ Inventory is empty - add at least one device, network, or IP range in \"Manage Inventory\" before running tests.")
-    elif st.button("🚀 Execute Tests", type="primary", use_container_width=True, disabled=_execute_disabled):
+    else:
+        _run_clicked = st.button("🚀 Execute Tests", type="primary", use_container_width=True, disabled=_execute_disabled)
+
+    if _run_clicked and _dash_device_catalog:
+        # Same isolated-env approach as the standard run below.
+        run_env = os.environ.copy()
+        run_env["ANTA_USERNAME"] = st.session_state.anta_user
+        run_env["ANTA_PASSWORD"] = st.session_state.anta_pass
+
+        dc_run_id = str(uuid.uuid4())[:8]
+        try:
+            _dc_inv = load_inventory()
+        except Exception:
+            _dc_inv = {}
+        _missing = inventory_catalog_warnings(_dash_cat_devices, _dc_inv)
+        if _missing:
+            st.warning(
+                "Catalogs without inventory name: " + ", ".join(f"`{m}`" for m in _missing)
+            )
+        log_event(
+            "device_catalog_suite_run",
+            {
+                "run_id": dc_run_id,
+                "profile": _dash_prof_name,
+                "device_count": len(_dash_cat_devices),
+                "catalogs_dir": _dash_cat_dir,
+            },
+        )
+        status_placeholder = st.empty()
+        status_placeholder.info(f"⏳ Starting device catalog run (Run ID: {dc_run_id})...")
+        full_log = ""
+        try:
+            results, full_log = run_device_catalog_suite(
+                catalogs_dir=_dash_cat_dir,
+                inventory_payload=_dc_inv,
+                run_env=run_env,
+                nrfu_timeout=NRFU_SUBPROCESS_TIMEOUT,
+                run_id=dc_run_id,
+                status_callback=lambda msg: status_placeholder.info(f"⏳ {msg} (Run ID: {dc_run_id})"),
+            )
+        finally:
+            status_placeholder.empty()
+        st.caption(f"Run ID: {dc_run_id}")
+        display_nrfu_results(st, results, full_log, run_id=dc_run_id)
+
+    elif _run_clicked:
         # Build an isolated env for this run's subprocess instead of mutating the
         # shared process-wide os.environ, which would race with other concurrent
         # user sessions running in the same Streamlit process.
         run_env = os.environ.copy()
         run_env["ANTA_USERNAME"] = st.session_state.anta_user
         run_env["ANTA_PASSWORD"] = st.session_state.anta_pass
-
-        if _dash_device_catalog:
-            try:
-                _dc_inv = load_inventory()
-            except Exception:
-                _dc_inv = {}
-            _missing = inventory_catalog_warnings(_dash_cat_devices, _dc_inv)
-            if _missing:
-                st.warning(
-                    "Catalogs without inventory name: " + ", ".join(f"`{m}`" for m in _missing)
-                )
-            log_event(
-                "device_catalog_suite_run",
-                {
-                    "profile": _dash_prof_name,
-                    "device_count": len(_dash_cat_devices),
-                    "catalogs_dir": _dash_cat_dir,
-                },
-            )
-            status_placeholder = st.empty()
-            full_log = ""
-            try:
-                results, full_log = run_device_catalog_suite(
-                    catalogs_dir=_dash_cat_dir,
-                    inventory_payload=_dc_inv,
-                    run_env=run_env,
-                    nrfu_timeout=NRFU_SUBPROCESS_TIMEOUT,
-                    status_callback=lambda msg: status_placeholder.info(f"⏳ {msg}"),
-                )
-            finally:
-                status_placeholder.empty()
-            display_nrfu_results(st, results, full_log)
-            st.stop()
 
         # Unique UUID per execution run to ensure isolated parallel execution
         run_id = str(uuid.uuid4())[:8]
@@ -2127,6 +2226,7 @@ with tab_dashboard:
                 col4.metric("🚨 Error / Exception", error)
                 col5.metric("⏭️ Skipped", skipped)
                 
+                results_export_buttons(st, df, run_id)
                 st.divider()
                 display_cols = ['name', 'categories', 'description', 'result', 'messages']
                 df_display = df[[col for col in display_cols if col in df.columns]].copy()
@@ -2315,3 +2415,9 @@ with tab_cli:
                 elif result is not None:
                     st.error("Error executing command.")
                     st.code(result.stderr or result.stdout, language=None)
+
+# ==========================================
+# TAB 6: HELP (usage guide, options, which test to use when)
+# ==========================================
+with tab_help:
+    render_help(st, CATEGORY_KEYS)

@@ -11,6 +11,7 @@ import re
 import subprocess
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable
 
 import pandas as pd
@@ -89,30 +90,160 @@ def _catalog_format(path: str) -> str:
     return "yaml"
 
 
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _error_row(device: str, category: str, description: str, message: str) -> dict[str, Any]:
+    return {
+        "name": device,
+        "categories": [category],
+        "description": description,
+        "result": "error",
+        "messages": [message],
+    }
+
+
+def _read_text(path: str) -> str:
+    if not os.path.exists(path):
+        return ""
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        return handle.read()
+
+
+def _run_one_device(
+    *,
+    device: str,
+    catalog_path: str,
+    inventory_payload: dict[str, Any],
+    run_env: dict[str, str],
+    run_id: str,
+    timeout: int,
+) -> tuple[list[dict[str, Any]], str]:
+    """Run ``anta nrfu`` for a single device catalog. Returns (result rows, console log)."""
+    out_file = f"temp_dcat_results_{run_id}_{device}.json"
+    stdout_file = f"temp_dcat_stdout_{run_id}_{device}.log"
+    stderr_file = f"temp_dcat_stderr_{run_id}_{device}.log"
+    inv_file = f"temp_dcat_inventory_{run_id}_{device}.yml"
+
+    try:
+        with open(inv_file, "w", encoding="utf-8") as handle:
+            yaml.safe_dump(inventory_payload, handle, sort_keys=False)
+
+        cmd = ["anta", "nrfu"]
+        # Same as the standard run: no --enable unless the operator opts in.
+        if os.environ.get("ANTA_DEVICE_CATALOG_ENABLE", "").strip().lower() in ("1", "true", "yes"):
+            cmd.append("--enable")
+        cmd += [
+            "-i", inv_file,
+            "-c", catalog_path,
+            "--catalog-format", _catalog_format(catalog_path),
+            "-d", device,
+            "--ignore-status",
+            "json",
+            "-o", out_file,
+        ]
+
+        start = time.time()
+        timed_out = False
+        with open(stdout_file, "w", encoding="utf-8") as out_f, open(
+            stderr_file, "w", encoding="utf-8"
+        ) as err_f:
+            proc = subprocess.Popen(cmd, stdout=out_f, stderr=err_f, text=True, env=run_env)
+            while proc.poll() is None:
+                if time.time() - start > timeout:
+                    proc.kill()
+                    proc.wait()
+                    timed_out = True
+                    break
+                time.sleep(0.2)
+
+        stdout = _read_text(stdout_file)
+        stderr = _read_text(stderr_file)
+        log = f"=== {device} ===\n{stdout}\n{stderr}"
+
+        if timed_out:
+            return [
+                _error_row(
+                    device,
+                    "timeout",
+                    "Device catalog run timed out",
+                    f"No result from {device} after {timeout}s - the device may be unreachable.",
+                )
+            ], log
+
+        if os.path.exists(out_file):
+            try:
+                with open(out_file, encoding="utf-8") as handle:
+                    chunk = json.load(handle)
+            except (json.JSONDecodeError, OSError) as exc:
+                return [_error_row(device, "parse", "Could not read ANTA JSON output", str(exc))], log
+            rows = chunk if isinstance(chunk, list) else [chunk]
+            if not rows:
+                # ANTA exits cleanly with an empty result list when it cannot reach the
+                # device ("No reachable devices found"), so without this row the switch
+                # would silently vanish from the table.
+                return [
+                    _error_row(
+                        device,
+                        "unreachable",
+                        "No test results returned",
+                        f"{device} returned no results - it is probably unreachable. "
+                        "See the ANTA console output below.",
+                    )
+                ], log
+            return rows, log
+
+        return [
+            _error_row(device, "anta", "ANTA produced no JSON output", stderr or stdout or "Unknown error")
+        ], log
+    finally:
+        for path in (out_file, inv_file, stdout_file, stderr_file):
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+
 def run_device_catalog_suite(
     *,
     catalogs_dir: str,
     inventory_payload: dict[str, Any],
     run_env: dict[str, str],
     nrfu_timeout: int,
+    run_id: str | None = None,
     status_callback: Callable[[str], None] | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
-    """Execute ``anta nrfu json`` once per ``<device>.json`` (or .yaml) catalog."""
+    """Execute ``anta nrfu json`` once per ``<device>.json`` (or .yaml) catalog.
+
+    Devices run in parallel (``ANTA_DEVICE_CATALOG_WORKERS``, default 4). Each device
+    gets its own timeout (``ANTA_DEVICE_CATALOG_TIMEOUT`` seconds, default 300, never
+    more than ``nrfu_timeout``) so one unreachable switch cannot hold up the others.
+    Results are returned in catalog (alphabetical) order. ``status_callback`` is only
+    ever called from the calling thread.
+    """
     device_names = list_device_catalogs(catalogs_dir)
     if not device_names:
         return [], ""
 
     inv_hosts = {
-        h.get("name"): h
+        h.get("name")
         for h in inventory_payload.get("anta_inventory", {}).get("hosts", [])
         if h.get("name")
     }
+    run_id = run_id or uuid.uuid4().hex[:8]
+    timeout = min(nrfu_timeout, _env_int("ANTA_DEVICE_CATALOG_TIMEOUT", 300))
+    workers = _env_int("ANTA_DEVICE_CATALOG_WORKERS", 4)
 
-    merged: list[dict[str, Any]] = []
-    logs: list[str] = []
-    run_id = uuid.uuid4().hex[:8]
+    per_device: dict[str, list[dict[str, Any]]] = {}
+    logs: dict[str, str] = {}
+    to_run: list[tuple[str, str]] = []
 
-    for idx, device in enumerate(device_names, start=1):
+    for device in device_names:
         catalog_path = None
         for ext in (".json", ".yaml", ".yml"):
             candidate = os.path.join(catalogs_dir, f"{device}{ext}")
@@ -121,121 +252,57 @@ def run_device_catalog_suite(
                 break
         if not catalog_path:
             continue
-
         if device not in inv_hosts:
-            merged.append(
-                {
-                    "name": device,
-                    "categories": ["inventory"],
-                    "description": "Catalog file has no matching inventory host name",
-                    "result": "error",
-                    "messages": [
-                        f"No inventory host named '{device}'. Add it under Manage Inventory "
-                        "(host **name** must match the catalog filename stem)."
-                    ],
-                }
-            )
-            continue
-
-        out_file = f"temp_dcat_results_{run_id}_{device}.json"
-        stdout_file = f"temp_dcat_stdout_{run_id}_{device}.log"
-        stderr_file = f"temp_dcat_stderr_{run_id}_{device}.log"
-        inv_file = f"temp_dcat_inventory_{run_id}_{device}.yml"
-
-        try:
-            with open(inv_file, "w", encoding="utf-8") as handle:
-                yaml.safe_dump(inventory_payload, handle, sort_keys=False)
-
-            cmd = [
-                "anta",
-                "nrfu",
-                "--enable",
-                "-i",
-                inv_file,
-                "-c",
-                catalog_path,
-                "--catalog-format",
-                _catalog_format(catalog_path),
-                "-d",
-                device,
-                "--ignore-status",
-                "json",
-                "-o",
-                out_file,
-            ]
-            if status_callback:
-                status_callback(f"Running catalog for **{device}** ({idx}/{len(device_names)})…")
-
-            start = time.time()
-            with open(stdout_file, "w", encoding="utf-8") as out_f, open(
-                stderr_file, "w", encoding="utf-8"
-            ) as err_f:
-                proc = subprocess.Popen(cmd, stdout=out_f, stderr=err_f, text=True, env=run_env)
-                timed_out = False
-                while proc.poll() is None:
-                    if time.time() - start > nrfu_timeout:
-                        proc.kill()
-                        proc.wait()
-                        timed_out = True
-                        break
-                    time.sleep(0.5)
-                if timed_out:
-                    merged.append(
-                        {
-                            "name": device,
-                            "categories": ["timeout"],
-                            "description": "Device catalog run timed out",
-                            "result": "error",
-                            "messages": [f"Exceeded {nrfu_timeout}s for {device}."],
-                        }
-                    )
-                    continue
-
-            stdout = open(stdout_file, encoding="utf-8").read() if os.path.exists(stdout_file) else ""
-            stderr = open(stderr_file, encoding="utf-8").read() if os.path.exists(stderr_file) else ""
-            logs.append(stdout + "\n" + stderr)
-
-            if os.path.exists(out_file):
-                try:
-                    with open(out_file, encoding="utf-8") as handle:
-                        chunk = json.load(handle)
-                    if isinstance(chunk, list):
-                        merged.extend(chunk)
-                    else:
-                        merged.append(chunk)
-                except (json.JSONDecodeError, OSError) as exc:
-                    merged.append(
-                        {
-                            "name": device,
-                            "categories": ["parse"],
-                            "description": "Could not read ANTA JSON output",
-                            "result": "error",
-                            "messages": [str(exc)],
-                        }
-                    )
-            else:
-                merged.append(
-                    {
-                        "name": device,
-                        "categories": ["anta"],
-                        "description": "ANTA produced no JSON output",
-                        "result": "error",
-                        "messages": [stderr or stdout or "Unknown error"],
-                    }
+            per_device[device] = [
+                _error_row(
+                    device,
+                    "inventory",
+                    "Catalog file has no matching inventory host name",
+                    f"No inventory host named '{device}'. Add it under Manage Inventory "
+                    "(the host name must match the catalog filename without its extension). "
+                    f"Inventory host names: {', '.join(sorted(inv_hosts)) or 'none'}.",
                 )
-        finally:
-            for path in (out_file, inv_file, stdout_file, stderr_file):
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
+            ]
+            continue
+        to_run.append((device, catalog_path))
 
+    done = 0
+    if to_run:
+        with ThreadPoolExecutor(max_workers=min(workers, len(to_run))) as pool:
+            futures = {
+                pool.submit(
+                    _run_one_device,
+                    device=device,
+                    catalog_path=catalog_path,
+                    inventory_payload=inventory_payload,
+                    run_env=run_env,
+                    run_id=run_id,
+                    timeout=timeout,
+                ): device
+                for device, catalog_path in to_run
+            }
+            if status_callback:
+                status_callback(f"Running catalogs for {len(to_run)} device(s)...")
+            for future in as_completed(futures):
+                device = futures[future]
+                done += 1
+                try:
+                    per_device[device], logs[device] = future.result()
+                except Exception as exc:  # keep one bad device from killing the run
+                    per_device[device] = [_error_row(device, "anta", "Device catalog run failed", str(exc))]
+                    logs[device] = f"=== {device} ===\n{exc}"
+                if status_callback:
+                    status_callback(f"Finished {device} ({done}/{len(to_run)})")
+
+    merged: list[dict[str, Any]] = []
+    for device in device_names:
+        merged.extend(per_device.get(device, []))
     ansi_escape = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
-    return merged, ansi_escape.sub("", "\n".join(logs))
+    full_log = "\n".join(logs[d] for d in device_names if d in logs)
+    return merged, ansi_escape.sub("", full_log)
 
 
-def display_nrfu_results(st, results: list[dict[str, Any]], full_log: str = "") -> None:
+def display_nrfu_results(st, results: list[dict[str, Any]], full_log: str = "", run_id: str = "") -> None:
     """Shared summary table for NRFU JSON result lists."""
     if not results:
         st.error("No test results returned.")
@@ -264,6 +331,9 @@ def display_nrfu_results(st, results: list[dict[str, Any]], full_log: str = "") 
     col4.metric("🚨 Error / Exception", error)
     col5.metric("⏭️ Skipped", skipped)
 
+    from results_export import results_export_buttons
+
+    results_export_buttons(st, df, run_id)
     st.divider()
     display_cols = ["name", "categories", "description", "result", "messages"]
     df_display = df[[col for col in display_cols if col in df.columns]].copy()

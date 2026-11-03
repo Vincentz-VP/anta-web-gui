@@ -111,3 +111,12 @@ docker run -p 8501:8501 \
 ```
 
 Inventory host **names** must match catalog filenames (e.g. `leaf1.json` → host name `leaf1`).
+
+Optional tuning (environment variables):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ANTA_DEVICE_CATALOG_WORKERS` | `4` | Devices run in parallel |
+| `ANTA_DEVICE_CATALOG_TIMEOUT` | `300` | Seconds per device before it is marked as an error (capped by the global NRFU timeout) |
+| `ANTA_DEVICE_CATALOG_ENABLE` | off | Set to `1` to pass `--enable` to `anta nrfu` for these runs |
+
